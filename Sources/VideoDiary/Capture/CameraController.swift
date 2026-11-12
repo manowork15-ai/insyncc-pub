@@ -3,6 +3,13 @@ import AVFoundation
 import SwiftUI
 
 /// Owns the capture session: live preview, device selection, mic level metering and recording.
+///
+/// Threading rule: the main thread never touches `session`, its inputs/outputs or the preview
+/// layer's connection. AVFoundation's `stopRunning()` synchronously hops to the main thread
+/// (movie file output teardown), so any session-lock acquisition on main — e.g. a preview layer
+/// being deallocated, which detaches it from the session — deadlocks the app. All session work
+/// happens on `queue`, metering on `meterQueue`, and the single preview layer lives as long as
+/// the controller so it is never deallocated mid-teardown.
 final class CameraController: NSObject, ObservableObject {
     @Published private(set) var cameraAccess = AVCaptureDevice.authorizationStatus(for: .video)
     @Published private(set) var micAccess = AVCaptureDevice.authorizationStatus(for: .audio)
@@ -16,16 +23,24 @@ final class CameraController: NSObject, ObservableObject {
     @Published private(set) var activeAudioID: String?
     @Published var lastError: String?
 
-    let session = AVCaptureSession()
+    /// One long-lived preview layer, re-parented into whichever view is showing the camera.
+    let previewLayer: AVCaptureVideoPreviewLayer
+
+    private let session = AVCaptureSession()
     private let queue = DispatchQueue(label: "VideoDiary.camera")
+    private let meterQueue = DispatchQueue(label: "VideoDiary.camera.meter")
     private let movieOutput = AVCaptureMovieFileOutput()
     private var videoInput: AVCaptureDeviceInput?
     private var audioInput: AVCaptureDeviceInput?
     private var configured = false
-    private var meterTimer: Timer?
+    private var meterTimer: DispatchSourceTimer?
     private var completion: ((Result<URL, Error>) -> Void)?
+    private var mirrored = true
 
     override init() {
+        previewLayer = AVCaptureVideoPreviewLayer(sessionWithNoConnection: session)
+        previewLayer.videoGravity = .resizeAspectFill
+        previewLayer.backgroundColor = NSColor.black.cgColor
         super.init()
         refreshDevices()
         NotificationCenter.default.addObserver(forName: AVCaptureDevice.wasConnectedNotification, object: nil, queue: .main) { [weak self] _ in
@@ -48,9 +63,9 @@ final class CameraController: NSObject, ObservableObject {
 
     func refreshDevices() {
         videoDevices = AVCaptureDevice.DiscoverySession(
-            deviceTypes: [.builtInWideAngleCamera, .external, .continuityCamera, .deskViewCamera],
+            deviceTypes: [.builtInWideAngleCamera, .external, .continuityCamera],
             mediaType: .video, position: .unspecified
-        ).devices.filter { $0.deviceType != .deskViewCamera }
+        ).devices
         audioDevices = AVCaptureDevice.DiscoverySession(
             deviceTypes: [.microphone, .external], mediaType: .audio, position: .unspecified
         ).devices
@@ -66,18 +81,20 @@ final class CameraController: NSObject, ObservableObject {
 
     func selectDevice(_ device: AVCaptureDevice, for type: AVMediaType) {
         UserDefaults.standard.set(device.uniqueID, forKey: type == .video ? Prefs.videoDevice : Prefs.audioDevice)
-        guard configured else { return }
         queue.async { [self] in
+            guard configured, !movieOutput.isRecording else { return }
             session.beginConfiguration()
             if type == .video {
                 if let old = videoInput { session.removeInput(old) }
                 videoInput = addInput(device)
+                connectPreview()
             } else {
                 if let old = audioInput { session.removeInput(old) }
                 audioInput = addInput(device)
             }
             session.commitConfiguration()
             applyCodec()
+            applyMirroring()
             publishActiveDevices()
         }
     }
@@ -89,8 +106,10 @@ final class CameraController: NSObject, ObservableObject {
         queue.async { [self] in
             configureIfNeeded()
             if !session.isRunning { session.startRunning() }
+            applyMirroring()
+            let running = session.isRunning
             DispatchQueue.main.async {
-                self.isRunning = self.session.isRunning
+                self.isRunning = running
                 self.startMeter()
             }
         }
@@ -98,14 +117,29 @@ final class CameraController: NSObject, ObservableObject {
 
     /// Turns the camera (and its green light) off. Ignored while recording.
     func stop() {
-        guard !isRecording else { return }
         stopMeter()
         queue.async { [self] in
-            if session.isRunning { session.stopRunning() }
+            guard !movieOutput.isRecording, session.isRunning else { return }
+            session.stopRunning()
             DispatchQueue.main.async { self.isRunning = false }
         }
     }
 
+    func setMirrored(_ value: Bool) {
+        queue.async { [self] in
+            mirrored = value
+            applyMirroring()
+        }
+    }
+
+    // Must run on `queue`.
+    private func applyMirroring() {
+        guard let connection = previewLayer.connection, connection.isVideoMirroringSupported else { return }
+        connection.automaticallyAdjustsVideoMirroring = false
+        connection.isVideoMirrored = mirrored
+    }
+
+    // Must run on `queue`.
     private func configureIfNeeded() {
         guard !configured else { return }
         session.beginConfiguration()
@@ -115,9 +149,13 @@ final class CameraController: NSObject, ObservableObject {
             session.sessionPreset = .high
         }
         if let device = preferredDevice(for: .video) { videoInput = addInput(device) }
-        if micAccess == .authorized, let device = preferredDevice(for: .audio) { audioInput = addInput(device) }
+        if AVCaptureDevice.authorizationStatus(for: .audio) == .authorized,
+           let device = preferredDevice(for: .audio) {
+            audioInput = addInput(device)
+        }
         if session.canAddOutput(movieOutput) { session.addOutput(movieOutput) }
         movieOutput.movieFragmentInterval = CMTime(seconds: 5, preferredTimescale: 1) // crash-safe files
+        connectPreview()
         session.commitConfiguration()
         applyCodec()
         configured = true
@@ -125,6 +163,14 @@ final class CameraController: NSObject, ObservableObject {
         if videoInput == nil {
             DispatchQueue.main.async { self.lastError = "No camera found." }
         }
+    }
+
+    /// The preview layer was created without a connection so its wiring happens here, on `queue`.
+    private func connectPreview() {
+        // Removing the previous input already removed its preview connection.
+        guard let port = videoInput?.ports.first(where: { $0.mediaType == .video }) else { return }
+        let connection = AVCaptureConnection(inputPort: port, videoPreviewLayer: previewLayer)
+        if session.canAddConnection(connection) { session.addConnection(connection) }
     }
 
     private func addInput(_ device: AVCaptureDevice) -> AVCaptureDeviceInput? {
@@ -135,9 +181,8 @@ final class CameraController: NSObject, ObservableObject {
 
     private func applyCodec() {
         guard let connection = movieOutput.connection(with: .video) else { return }
-        let wantHEVC = UserDefaults.standard.bool(forKey: Prefs.hevc)
         // Every Mac that runs macOS 14 can encode HEVC in hardware.
-        let codec: AVVideoCodecType = wantHEVC ? .hevc : .h264
+        let codec: AVVideoCodecType = UserDefaults.standard.bool(forKey: Prefs.hevc) ? .hevc : .h264
         movieOutput.setOutputSettings([AVVideoCodecKey: codec], for: connection)
     }
 
@@ -168,29 +213,36 @@ final class CameraController: NSObject, ObservableObject {
         }
     }
 
-    // MARK: Metering
+    // MARK: Metering (off the main thread)
 
     private func startMeter() {
-        meterTimer?.invalidate()
-        meterTimer = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) { [weak self] _ in
+        stopMeter()
+        let timer = DispatchSource.makeTimerSource(queue: meterQueue)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(80))
+        var smoothed: Float = 0
+        timer.setEventHandler { [weak self] in
             guard let self else { return }
             if let channel = self.movieOutput.connection(with: .audio)?.audioChannels.first {
                 // Map -50 dB...0 dB onto 0...1 with a little smoothing.
                 let db = max(-50, min(0, channel.averagePowerLevel))
-                let level = (db + 50) / 50
-                self.audioLevel = self.audioLevel * 0.5 + level * 0.5
+                smoothed = smoothed * 0.5 + ((db + 50) / 50) * 0.5
             } else {
-                self.audioLevel = 0
+                smoothed = 0
             }
-            if self.isRecording {
-                let seconds = self.movieOutput.recordedDuration.seconds
-                if seconds.isFinite { self.elapsed = seconds }
+            let recording = self.movieOutput.isRecording
+            let seconds = recording ? self.movieOutput.recordedDuration.seconds : 0
+            let level = smoothed
+            DispatchQueue.main.async {
+                self.audioLevel = level
+                if recording, seconds.isFinite { self.elapsed = seconds }
             }
         }
+        meterTimer = timer
+        timer.resume()
     }
 
     private func stopMeter() {
-        meterTimer?.invalidate()
+        meterTimer?.cancel()
         meterTimer = nil
         audioLevel = 0
     }
@@ -219,51 +271,77 @@ extension CameraController: AVCaptureFileOutputRecordingDelegate {
 
 // MARK: - Preview
 
+/// Hosts the controller's shared preview layer. Views come and go; the layer does not,
+/// so tearing down a view never touches the capture session.
 struct CameraPreview: NSViewRepresentable {
-    let session: AVCaptureSession
+    let camera: CameraController
     var mirrored: Bool
-    /// Passed in so SwiftUI re-runs `updateNSView` once the connection exists.
-    var isRunning: Bool
 
-    func makeNSView(context: Context) -> PreviewView {
-        let view = PreviewView()
-        view.previewLayer.session = session
-        view.mirrored = mirrored
+    func makeNSView(context: Context) -> HostView {
+        let view = HostView(previewLayer: camera.previewLayer)
+        camera.setMirrored(mirrored)
         return view
     }
 
-    func updateNSView(_ view: PreviewView, context: Context) {
-        view.mirrored = mirrored
+    func updateNSView(_ view: HostView, context: Context) {
+        view.claim()
+        if context.coordinator.mirrored != mirrored {
+            context.coordinator.mirrored = mirrored
+            camera.setMirrored(mirrored)
+        }
     }
 
-    final class PreviewView: NSView {
-        let previewLayer = AVCaptureVideoPreviewLayer()
-        var mirrored = true { didSet { applyMirroring() } }
+    func makeCoordinator() -> Coordinator { Coordinator(mirrored: mirrored) }
 
-        override init(frame: NSRect) {
-            super.init(frame: frame)
+    static func dismantleNSView(_ view: HostView, coordinator: Coordinator) {
+        view.release()
+    }
+
+    final class Coordinator {
+        var mirrored: Bool
+        init(mirrored: Bool) { self.mirrored = mirrored }
+    }
+
+    final class HostView: NSView {
+        private let previewLayer: AVCaptureVideoPreviewLayer
+
+        init(previewLayer: AVCaptureVideoPreviewLayer) {
+            self.previewLayer = previewLayer
+            super.init(frame: .zero)
             wantsLayer = true
             layer = CALayer()
             layer?.backgroundColor = NSColor.black.cgColor
-            previewLayer.videoGravity = .resizeAspectFill
-            layer?.addSublayer(previewLayer)
+            claim()
         }
 
         required init?(coder: NSCoder) { fatalError() }
 
+        /// Moves the shared layer into this view (plain CALayer re-parenting; no session access).
+        func claim() {
+            guard let host = layer, previewLayer.superlayer !== host else { return }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            previewLayer.removeFromSuperlayer()
+            host.addSublayer(previewLayer)
+            previewLayer.frame = bounds
+            CATransaction.commit()
+        }
+
+        func release() {
+            guard previewLayer.superlayer === layer else { return }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            previewLayer.removeFromSuperlayer()
+            CATransaction.commit()
+        }
+
         override func layout() {
             super.layout()
+            guard previewLayer.superlayer === layer else { return }
             CATransaction.begin()
             CATransaction.setDisableActions(true)
             previewLayer.frame = bounds
             CATransaction.commit()
-            applyMirroring()
-        }
-
-        private func applyMirroring() {
-            guard let connection = previewLayer.connection, connection.isVideoMirroringSupported else { return }
-            connection.automaticallyAdjustsVideoMirroring = false
-            connection.isVideoMirrored = mirrored
         }
     }
 }

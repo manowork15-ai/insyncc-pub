@@ -40,7 +40,7 @@ private struct CaptureView: View {
 
     var body: some View {
         ZStack {
-            CameraPreview(session: camera.session, mirrored: mirror, isRunning: camera.isRunning)
+            CameraPreview(camera: camera, mirrored: mirror)
                 .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
                 .overlay {
                     if !camera.isRunning {

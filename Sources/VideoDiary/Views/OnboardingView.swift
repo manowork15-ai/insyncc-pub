@@ -303,7 +303,7 @@ private struct CameraStep: View {
 
             ZStack {
                 if camera.cameraAccess == .authorized {
-                    CameraPreview(session: camera.session, mirrored: mirror, isRunning: camera.isRunning)
+                    CameraPreview(camera: camera, mirrored: mirror)
                 } else {
                     Color.black.opacity(0.85)
                     if camera.cameraAccess == .denied {
