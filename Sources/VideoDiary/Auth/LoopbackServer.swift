@@ -3,7 +3,7 @@ import Network
 
 /// A one-shot HTTP server on 127.0.0.1 that catches Google's OAuth redirect
 /// (the loopback flow Google recommends for desktop apps).
-final class LoopbackServer {
+final class LoopbackServer: @unchecked Sendable { // all state is confined to `queue`
     private let queue = DispatchQueue(label: "VideoDiary.oauth.loopback")
     private var listener: NWListener?
     private var continuation: CheckedContinuation<URL, Error>?
@@ -17,16 +17,15 @@ final class LoopbackServer {
         self.listener = listener
 
         return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<UInt16, Error>) in
-            var resumed = false
+            let once = ResumeOnce()
             listener.stateUpdateHandler = { [weak self] state in
                 switch state {
                 case .ready:
-                    if !resumed, let port = listener.port?.rawValue {
-                        resumed = true
+                    if let port = listener.port?.rawValue, once.claim() {
                         cont.resume(returning: port)
                     }
                 case .failed(let error):
-                    if !resumed { resumed = true; cont.resume(throwing: error) }
+                    if once.claim() { cont.resume(throwing: error) }
                     self?.finish(.failure(error))
                 default:
                     break
@@ -108,5 +107,16 @@ final class LoopbackServer {
         h1{font-size:22px;margin:0 0 8px}p{color:#6e6e73;margin:0}</style></head>
         <body><div class="card"><h1>\(title)</h1><p>\(message)</p></div></body></html>
         """
+    }
+}
+
+private final class ResumeOnce: @unchecked Sendable {
+    private var done = false
+    private let lock = NSLock()
+    func claim() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if done { return false }
+        done = true
+        return true
     }
 }

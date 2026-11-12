@@ -136,7 +136,8 @@ final class CameraController: NSObject, ObservableObject {
     private func applyCodec() {
         guard let connection = movieOutput.connection(with: .video) else { return }
         let wantHEVC = UserDefaults.standard.bool(forKey: Prefs.hevc)
-        let codec: AVVideoCodecType = wantHEVC && movieOutput.availableVideoCodecTypes.contains(.hevc) ? .hevc : .h264
+        // Every Mac that runs macOS 14 can encode HEVC in hardware.
+        let codec: AVVideoCodecType = wantHEVC ? .hevc : .h264
         movieOutput.setOutputSettings([AVVideoCodecKey: codec], for: connection)
     }
 
